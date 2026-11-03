@@ -1,0 +1,10 @@
+.venv/
+.pip-tmp/
+__pycache__/
+*.pyc
+.gpu_runtime_initialized
+.torch_cuda_initialized
+*.sqlite3
+*.db
+app.py.bak*
+*.log
