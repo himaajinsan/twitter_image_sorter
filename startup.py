@@ -14,9 +14,24 @@ from tkinter import ttk
 
 ROOT = Path(__file__).resolve().parent
 GPU_RUNTIME_MARKER = ROOT / ".gpu_runtime_initialized"
+GPU_RUNTIME_SPEC = "cu132"
 TORCH_CUDA_MARKER = ROOT / ".torch_cuda_initialized"
 TORCH_CUDA_SPEC = "cu132"
-CUDA_DLL_NAMES = {"cublasLt64_12.dll", "cudart64_12.dll", "cudnn64_9.dll"}
+ONNXRUNTIME_GPU_REQUIREMENT = "onnxruntime-gpu==1.31.1"
+CURAND_REQUIREMENT = "nvidia-curand==10.4.4.72"
+IS_WINDOWS = sys.platform == "win32"
+# CUDA 13 runtime files. Windows keeps them in ``nvidia/*/bin`` as DLLs and
+# PyTorch bundles its own copies in ``torch/lib``; Linux keeps them in
+# ``nvidia/*/lib`` (including the combined ``nvidia/cu13/lib`` directory).
+CUDA_RUNTIME_PATTERNS = (
+    ("cublas64_13.dll", "cublasLt64_13.dll", "cudart64_13.dll",
+     "cudnn64_9.dll", "curand64_10.dll")
+    if IS_WINDOWS
+    else ("libcublas.so.13*", "libcublasLt.so.13*", "libcudart.so.13*",
+          "libcudnn.so.9*", "libcurand.so.10*")
+)
+CUDNN_RUNTIME_PATTERNS = ("cudnn64_9.dll",) if IS_WINDOWS else ("libcudnn.so.9*",)
+LAUNCHER_NAME = "run_windows.bat" if IS_WINDOWS else "run_linux.sh"
 PIP_TEMP_DIR = ROOT / ".pip-tmp"
 
 
@@ -126,68 +141,144 @@ class SetupWindow:
         TORCH_CUDA_MARKER.write_text(TORCH_CUDA_SPEC + "\n", encoding="ascii")
 
     def repair_gpu_runtime(self):
-        first_setup = not GPU_RUNTIME_MARKER.is_file()
-        cuda12_ready = self.cuda12_runtime_files_present()
-        if first_setup:
-            self.update("GPUランタイムを初回セットアップ中…",
-                        "既存のCPU/GPU版ONNX Runtimeを整理しています", 32)
-            for package in ("onnxruntime", "onnxruntime-gpu"):
-                self.run_logged(self.pip_command("uninstall", "-y", package))
-            self.install_gpu_runtime(force=True)
-            GPU_RUNTIME_MARKER.write_text("GPU runtime initialized\n", encoding="ascii")
+        forced = os.environ.get("TWITTER_SORTER_FORCE_GPU_REPAIR") == "1"
+        marker_value = (
+            GPU_RUNTIME_MARKER.read_text(encoding="ascii").strip()
+            if GPU_RUNTIME_MARKER.is_file() else ""
+        )
+        if not forced and marker_value == GPU_RUNTIME_SPEC:
+            # The runtime was verified during the first launch. Never import
+            # onnxruntime or force-reinstall GPU packages on later starts:
+            # a broken ``onnxruntime.__version__`` must not stop the app.
+            self.update(
+                "GPUランタイム確認済み",
+                "初回セットアップ済みのランタイムを使用します",
+                34,
+            )
             return
 
+        legacy_packages = self.installed_cuda12_packages()
+        cuda_ready = self.cuda13_runtime_files_present()
+        version, cuda_major, providers = "", "", []
         try:
             import onnxruntime
-            providers = onnxruntime.get_available_providers()
-        except ImportError:
-            providers = []
-        if "CUDAExecutionProvider" in providers and cuda12_ready:
-            self.update("GPUランタイム確認済み", "CUDAExecutionProvider が利用可能です", 34)
+        except Exception:
+            onnxruntime = None
+        if onnxruntime is not None:
+            version = getattr(onnxruntime, "__version__", "") or ""
+            if not version:
+                try:
+                    version = metadata.version("onnxruntime-gpu")
+                except Exception:
+                    version = ""
+            cuda_major = str(
+                getattr(onnxruntime, "cuda_version", "") or ""
+            ).split(".")[0]
+            try:
+                providers = onnxruntime.get_available_providers()
+            except Exception:
+                providers = []
+        ort_ready = (
+            self.version_satisfies(version, ">=", "1.27")
+            and cuda_major == "13"
+            and "CUDAExecutionProvider" in providers
+        )
+
+        if not forced and not legacy_packages and cuda_ready and ort_ready:
+            # Everything already shares CUDA 13. Just refresh the marker when
+            # migrating from an older setup without reinstalling packages.
+            GPU_RUNTIME_MARKER.write_text(GPU_RUNTIME_SPEC + "\n", encoding="ascii")
+            self.update(
+                "GPUランタイム確認済み",
+                f"ONNX Runtime {version} / CUDA {cuda_major} で動作します",
+                34,
+            )
             return
-        self.update("GPUランタイムを確認中…",
-                    "CUDA 12 DLLまたはCUDAExecutionProviderが不足しています", 33)
-        if not cuda12_ready:
-            self.update("CUDA 12ランタイムを修復中…", "必要なDLLが見つかりません", 33)
-            self.install_gpu_runtime(force=True)
-            GPU_RUNTIME_MARKER.write_text("GPU runtime initialized\n", encoding="ascii")
-            self.update("GPUランタイムを修復しました", "アプリを起動します", 35)
-            return
-        if os.environ.get("TWITTER_SORTER_FORCE_GPU_REPAIR") != "1":
-            self.update("GPUランタイム確認済み", "CUDAが利用できないためCPUモードで起動します", 34)
-            return
-        self.update("GPUランタイムを修復中…", "CUDAExecutionProvider が見つかりません", 33)
-        self.install_gpu_runtime(force=True)
-        self.update("GPUランタイムを修復しました", "利用できない場合はCPUモードで続行します", 35)
+
+        self.update(
+            "GPUランタイムをCUDA 13.2へ更新中…",
+            "旧CUDA 12ランタイムを整理し、ONNX Runtimeを揃えています",
+            32,
+        )
+        self.install_gpu_runtime(force=forced or not ort_ready or not cuda_ready)
+        GPU_RUNTIME_MARKER.write_text(GPU_RUNTIME_SPEC + "\n", encoding="ascii")
+        self.update("GPUランタイムを更新しました", "アプリを起動します", 35)
 
     @staticmethod
-    def cuda12_runtime_files_present():
+    def installed_cuda12_packages():
+        """Return legacy CUDA 12 wheels that must be removed before CUDA 13."""
+        try:
+            from importlib import metadata
+            names = []
+            for distribution in metadata.distributions():
+                name = distribution.metadata.get("Name")
+                if name and name.replace("_", "-").lower().endswith("-cu12"):
+                    names.append(name)
+            return sorted(set(names))
+        except Exception:
+            return []
+
+    @staticmethod
+    def cuda13_runtime_files_present():
+        return SetupWindow._runtime_files_present(CUDA_RUNTIME_PATTERNS)
+
+    @staticmethod
+    def cudnn13_files_present():
+        return SetupWindow._runtime_files_present(CUDNN_RUNTIME_PATTERNS)
+
+    @staticmethod
+    def _runtime_files_present(patterns):
         try:
             import site
             roots = [Path(p) for p in site.getsitepackages()]
             roots.append(Path(site.getusersitepackages()))
-            dlls = CUDA_DLL_NAMES
-            found = {
-                name
-                for root in roots
-                for directory in root.glob("nvidia/*/bin")
-                for name in dlls
-                if (directory / name).is_file()
-            }
-            return found == dlls
+            found = set()
+            for root in roots:
+                subdir = "bin" if IS_WINDOWS else "lib"
+                directories = list(root.glob(f"nvidia/*/{subdir}"))
+                if IS_WINDOWS:
+                    # PyTorch's Windows wheel bundles its CUDA DLLs here.
+                    torch_lib = root / "torch" / "lib"
+                    if torch_lib.is_dir():
+                        directories.append(torch_lib)
+                for directory in directories:
+                    for pattern in patterns:
+                        if any(directory.glob(pattern)):
+                            found.add(pattern)
+            return found == set(patterns)
         except Exception:
             return False
 
     def install_gpu_runtime(self, force=False):
-        packages = [
-            "onnxruntime-gpu==1.20.2",
-            "nvidia-cuda-runtime-cu12",
-            "nvidia-cuda-nvrtc-cu12",
-            "nvidia-cublas-cu12",
-            "nvidia-cufft-cu12",
-            "nvidia-cudnn-cu12",
-        ]
-        for package in packages:
+        # CUDA 12 and CUDA 13 wheels write into the same nvidia/<component>
+        # directories. Remove the CUDA 12 wheels *first*: uninstalling them
+        # after CUDA 13 can delete shared files such as libcudnn.so.9.
+        legacy_packages = self.installed_cuda12_packages()
+        if legacy_packages:
+            self.update("旧CUDA 12ランタイムを削除中…", ", ".join(legacy_packages), 33)
+            for package in legacy_packages:
+                self.run_logged(self.pip_command("uninstall", "-y", package))
+
+        # NudeNet declares a dependency on the CPU package name.
+        self.run_logged(self.pip_command("uninstall", "-y", "onnxruntime"))
+
+        if not self.cudnn13_files_present():
+            self.update(
+                "CUDA 13 cuDNNを修復中…",
+                "CUDA 12版との共存で消えたファイルを戻しています",
+                34,
+            )
+            result = self.run_logged(self.pip_command(
+                "install", "--upgrade", "--force-reinstall", "nvidia-cudnn-cu13",
+            ))
+            if result.returncode:
+                raise RuntimeError(
+                    (result.stderr.strip() or result.stdout.strip()
+                     or "nvidia-cudnn-cu13 のインストールに失敗しました")
+                    + f"\n\nVS Code/アプリを閉じて、もう一度 {LAUNCHER_NAME} を実行してください。"
+                )
+
+        for package in (ONNXRUNTIME_GPU_REQUIREMENT, CURAND_REQUIREMENT):
             self.update("GPUランタイムをインストール中…", package, 34)
             args = ["install", "--upgrade"]
             if force:
@@ -197,7 +288,7 @@ class SetupWindow:
                 raise RuntimeError(
                     (result.stderr.strip() or result.stdout.strip()
                      or f"{package} のインストールに失敗しました")
-                    + "\n\nVS Code/アプリを閉じて、もう一度 run_windows.bat を実行してください。"
+                    + f"\n\nVS Code/アプリを閉じて、もう一度 {LAUNCHER_NAME} を実行してください。"
                 )
 
     def install_if_needed(self, requirement, progress, import_name=None):

@@ -1,5 +1,6 @@
 import os
 import shutil
+import sqlite3
 import threading
 import queue
 import traceback
@@ -53,6 +54,103 @@ def build_detector(use_gpu=True):
         detector = NudeDetector(providers=["CPUExecutionProvider"])
         print(f"[GPU] NudeNet active providers: {detector.onnx_session.get_providers()}", flush=True)
         return detector, "CPU (CUDA初期化失敗)"
+
+
+def _thumbnail_cluster_choices(database):
+    """Return cluster labels and row counts for the thumbnail selector."""
+    path = str(database or "").strip()
+    values = ["すべて"]
+    counts = {"すべて": 0}
+    if not path:
+        return values, counts
+    database_path = Path(path).expanduser()
+    if not database_path.is_file():
+        return values, counts
+    try:
+        db = sqlite3.connect(str(database_path))
+        try:
+            db.execute("PRAGMA query_only = ON")
+            rows = db.execute(
+                "SELECT cluster_id, COUNT(*) FROM images "
+                "GROUP BY cluster_id ORDER BY cluster_id IS NULL, cluster_id"
+            ).fetchall()
+        finally:
+            db.close()
+    except (sqlite3.Error, OSError):
+        return values, counts
+    for cluster_id, count in rows:
+        label = "未クラスタ" if cluster_id is None else str(cluster_id)
+        values.append(label)
+        counts[label] = int(count)
+        counts["すべて"] += int(count)
+    return values, counts
+
+
+def _thumbnail_cluster_paths(database, cluster="すべて", sql_text=""):
+    """Return image paths and display info for the thumbnail cluster view."""
+    path = str(database or "").strip()
+    info = {"total": 0, "missing": 0}
+    if not path:
+        return [], {**info, "error": "SQLiteデータベースを指定してください"}
+    database_path = Path(path).expanduser()
+    if not database_path.is_file():
+        return [], {**info, "error": f"データベースが見つかりません: {database_path}"}
+
+    try:
+        db = sqlite3.connect(str(database_path))
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute("PRAGMA query_only = ON")
+            statement = (sql_text or "").strip()
+            if statement.lower().startswith(("select", "with")):
+                # Allow a full read-only query that returns a path column.
+                raw_paths = []
+                for row in db.execute(statement).fetchall():
+                    keys = row.keys()
+                    value = row["path"] if "path" in keys else row[0]
+                    if value:
+                        raw_paths.append(str(value))
+            else:
+                # Otherwise treat the text as an additional WHERE expression.
+                clauses = []
+                parameters = []
+                if cluster and cluster != "すべて":
+                    if cluster == "未クラスタ":
+                        clauses.append("cluster_id IS NULL")
+                    else:
+                        clauses.append("cluster_id = ?")
+                        parameters.append(int(cluster))
+                if statement:
+                    clauses.append(f"({statement})")
+                query = "SELECT path FROM images"
+                if clauses:
+                    query += " WHERE " + " AND ".join(clauses)
+                query += " ORDER BY path"
+                raw_paths = [
+                    str(row[0])
+                    for row in db.execute(query, parameters).fetchall()
+                ]
+        finally:
+            db.close()
+    except (sqlite3.Error, OSError, ValueError, IndexError) as exc:
+        return [], {**info, "error": str(exc)}
+
+    found = []
+    seen = set()
+    missing = 0
+    for value in raw_paths:
+        image_path = Path(value).expanduser()
+        key = str(image_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not image_path.is_file():
+            missing += 1
+            continue
+        if image_path.suffix.lower() not in EXTS:
+            continue
+        found.append(image_path)
+    return found, {"total": len(raw_paths), "missing": missing}
 
 
 class App:
@@ -285,30 +383,128 @@ class App:
             ).grid(row=0, column=0, sticky="w")
             return
         f.columnconfigure(0, weight=1)
-        f.rowconfigure(2, weight=1)
+        f.rowconfigure(6, weight=1)
         folder_var = self.pipeline_folder
+        source_var = tk.StringVar(value="フォルダ")
+        cluster_var = tk.StringVar(value="すべて")
+        sql_var = tk.StringVar()
+        list_status = tk.StringVar(
+            value="表示するフォルダまたはSQLiteデータベースを指定してください"
+        )
+        cluster_counts = {}
+        scan_info = {}
+
+        source_row = ttk.Frame(f)
+        source_row.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        ttk.Label(source_row, text="表示元").pack(side="left")
+        source_combo = ttk.Combobox(
+            source_row,
+            textvariable=source_var,
+            state="readonly",
+            values=("フォルダ", "SQLiteクラスタ"),
+            width=16,
+        )
+        source_combo.pack(side="left", padx=(6, 16))
+        ttk.Label(source_row, text="1列の画像数").pack(side="left")
+        column_var = tk.StringVar(value="8")
+        column_spin = ttk.Spinbox(
+            source_row, from_=1, to=12, width=5, textvariable=column_var,
+            command=lambda: set_columns(),
+        )
+        column_spin.pack(side="left", padx=4)
+        ttk.Button(source_row, text="更新", command=lambda: reload_view()).pack(
+            side="left", padx=(12, 0)
+        )
+
         folder_controls = ttk.Frame(f)
-        folder_controls.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        folder_controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         folder_controls.columnconfigure(1, weight=1)
         ttk.Label(folder_controls, text="表示フォルダ").grid(
             row=0, column=0, sticky="w"
         )
         folder_entry = ttk.Entry(folder_controls, textvariable=folder_var)
         folder_entry.grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Button(
+            folder_controls,
+            text="フォルダを1つ選ぶ…",
+            command=lambda: choose_thumbnail_folder(),
+        ).grid(row=0, column=2)
+
+        db_controls = ttk.Frame(f)
+        db_controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        db_controls.columnconfigure(1, weight=1)
+        ttk.Label(db_controls, text="SQLite DB").grid(row=0, column=0, sticky="w")
+        db_entry = ttk.Entry(db_controls, textvariable=self.database)
+        db_entry.grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Button(
+            db_controls,
+            text="DBを選ぶ…",
+            command=lambda: choose_thumbnail_database(),
+        ).grid(row=0, column=2)
+
+        cluster_controls = ttk.Frame(f)
+        cluster_controls.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        ttk.Label(cluster_controls, text="クラスタ").pack(side="left")
+        cluster_combo = ttk.Combobox(
+            cluster_controls,
+            textvariable=cluster_var,
+            state="readonly",
+            values=("すべて",),
+            width=14,
+        )
+        cluster_combo.pack(side="left", padx=(6, 8))
+        previous_btn = ttk.Button(
+            cluster_controls, text="◀ 前", command=lambda: step_cluster(-1)
+        )
+        previous_btn.pack(side="left", padx=2)
+        next_btn = ttk.Button(
+            cluster_controls, text="次 ▶", command=lambda: step_cluster(1)
+        )
+        next_btn.pack(side="left", padx=2)
+        refresh_btn = ttk.Button(
+            cluster_controls,
+            text="クラスタ一覧を更新",
+            command=lambda: refresh_cluster_choices(True),
+        )
+        refresh_btn.pack(side="left", padx=(10, 0))
+        ttk.Label(cluster_controls, text="クラスタ数").pack(
+            side="left", padx=(14, 0)
+        )
+        cluster_count_entry = ttk.Entry(
+            cluster_controls, textvariable=self.cluster_count, width=7
+        )
+        cluster_count_entry.pack(side="left", padx=4)
+        recluster_btn = ttk.Button(
+            cluster_controls, text="再分類", command=lambda: recluster()
+        )
+        recluster_btn.pack(side="left", padx=2)
+
+        sql_controls = ttk.Frame(f)
+        sql_controls.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        sql_controls.columnconfigure(1, weight=1)
         ttk.Label(
-            f,
-            text="1つのフォルダ内の画像を、横幅いっぱいの隙間なしサムネイルで表示します",
-        ).grid(row=1, column=0, sticky="w", pady=(0, 6))
+            sql_controls,
+            text="SQL（任意 / SELECT・WITH以外はWHERE条件）",
+        ).grid(row=0, column=0, sticky="w")
+        sql_entry = ttk.Entry(sql_controls, textvariable=sql_var)
+        sql_entry.grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Button(
+            sql_controls, text="適用", command=lambda: scan_folder()
+        ).grid(row=0, column=2)
+
+        ttk.Label(
+            f, textvariable=list_status, wraplength=900, anchor="w"
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         canvas = tk.Canvas(f, background="#202020", highlightthickness=0)
-        canvas.grid(row=2, column=0, sticky="nsew")
+        canvas.grid(row=6, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(f, orient="vertical", command=canvas.yview)
-        scrollbar.grid(row=2, column=1, sticky="ns")
+        scrollbar.grid(row=6, column=1, sticky="ns")
         canvas.configure(yscrollcommand=scrollbar.set)
         selection_status = tk.StringVar(
             value="画像をクリックすると番号とファイル名を表示します"
         )
         ttk.Label(f, textvariable=selection_status, anchor="center").grid(
-            row=3, column=0, sticky="ew", pady=(4, 0)
+            row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0)
         )
         from collections import OrderedDict
 
@@ -318,8 +514,9 @@ class App:
         empty_item = None
         scan_generation = 0
         thumb_generation = 0
-        last_folder = None
+        last_signature = None
         scan_in_flight = False
+        cluster_in_flight = False
         photo_cache = OrderedDict()
         pending = set()
         items = {}
@@ -328,6 +525,7 @@ class App:
         render_job = None
         resize_job = None
         scan_job = None
+        database_job = None
         poll_job = None
 
         def safe_mtime(path):
@@ -362,7 +560,7 @@ class App:
                 except Exception:
                     results.put(("thumb", gen, key, None))
 
-        for _ in range(8):
+        for _ in range(4):
             threading.Thread(target=thumb_worker, daemon=True).start()
 
         def clear_cells():
@@ -379,10 +577,10 @@ class App:
                 if cached_size != size or not keep_lo <= index < keep_hi:
                     del photo_cache[key]
 
-        def schedule_poll():
+        def schedule_poll(delay=20):
             nonlocal poll_job
             if poll_job is None:
-                poll_job = canvas.after(20, poll_results)
+                poll_job = canvas.after(delay, poll_results)
 
         def request_thumb(index, size):
             key = (index, size)
@@ -394,13 +592,15 @@ class App:
             jobs.put((files[index], size, thumb_generation, key))
             schedule_poll()
 
-        def apply_scan(found):
-            nonlocal files, scan_in_flight, thumb_generation
+        def apply_scan(found, info):
+            nonlocal files, scan_in_flight, thumb_generation, scan_info
             scan_in_flight = False
+            scan_info = info or {}
             changed = [str(path) for path in found] != [
                 str(path) for path in files
             ]
             files = found
+            update_list_status()
             if not changed:
                 render()
                 return
@@ -418,15 +618,26 @@ class App:
             render(force=True)
 
         def poll_results():
-            nonlocal poll_job
+            nonlocal poll_job, cluster_in_flight
             poll_job = None
             try:
                 while True:
                     message = results.get_nowait()
                     if message[0] == "scan":
-                        _, gen, found = message
+                        _, gen, found, info = message
                         if gen == scan_generation:
-                            apply_scan(found)
+                            apply_scan(found, info)
+                        continue
+                    if message[0] == "clustered":
+                        _, error, count = message
+                        cluster_in_flight = False
+                        recluster_btn.configure(state="normal")
+                        if error:
+                            list_status.set(f"クラスタリングエラー: {error}")
+                            continue
+                        self.cluster_count.set(str(count))
+                        refresh_cluster_choices(False)
+                        scan_folder()
                         continue
                     _, gen, key, image = message
                     pending.discard(key)
@@ -448,6 +659,10 @@ class App:
                 pass
             if pending or scan_in_flight or not results.empty():
                 schedule_poll()
+            elif cluster_in_flight:
+                # Re-clustering can take a while; check less often so the UI
+                # stays responsive without a 20 ms polling loop.
+                schedule_poll(200)
 
         def render(force=False):
             nonlocal render_job, layout_size, empty_item
@@ -465,8 +680,15 @@ class App:
                 canvas.delete("all")
                 if scan_in_flight:
                     message = "読み込み中…"
-                elif not folder_var.get().strip():
-                    message = "表示フォルダを選択してください"
+                elif scan_info.get("error"):
+                    message = f"エラー: {scan_info['error']}"
+                elif current_source() == "フォルダ":
+                    if not folder_var.get().strip():
+                        message = "表示フォルダを選択してください"
+                    else:
+                        message = "画像がありません"
+                elif not self.database.get().strip():
+                    message = "SQLiteデータベースを選択してください"
                 else:
                     message = "画像がありません"
                 empty_item = canvas.create_text(
@@ -486,9 +708,6 @@ class App:
                     if key[1] != size:
                         del photo_cache[key]
                 layout_size = size
-            if size_changed:
-                canvas.yview_moveto(0)
-
             top_row = max(0, int(canvas.canvasy(0) // size))
             view_rows = max(1, int(canvas.winfo_height() // size) + 1)
             first = max(0, top_row - 1)
@@ -535,57 +754,198 @@ class App:
 
         def set_columns(event=None):
             nonlocal columns
+            scroll_position = canvas.yview()[0]
             try:
                 columns = max(1, min(12, int(column_var.get())))
             except ValueError:
                 columns = 8
             column_var.set(str(columns))
             render(force=True)
+            canvas.yview_moveto(scroll_position)
+
+        def current_source():
+            return source_var.get().strip() or "フォルダ"
+
+        def update_list_status():
+            source = current_source()
+            total = len(files)
+            if source == "フォルダ":
+                folder = folder_var.get().strip()
+                if scan_in_flight:
+                    list_status.set("フォルダを読み込み中…")
+                elif not folder:
+                    list_status.set("表示フォルダを選択してください")
+                else:
+                    list_status.set(f"フォルダ: {total} 枚 / {folder}")
+                return
+            database = self.database.get().strip()
+            cluster = cluster_var.get().strip() or "すべて"
+            if scan_in_flight:
+                list_status.set(f"クラスタ {cluster} を読み込み中…")
+                return
+            if not database:
+                list_status.set("SQLiteデータベースを選択してください")
+                return
+            parts = [f"クラスタ: {cluster}", f"{total} 枚"]
+            count = cluster_counts.get(cluster)
+            if count is not None:
+                parts.append(f"DB上 {count} 行")
+            if scan_info.get("missing"):
+                parts.append(f"見つからないファイル {scan_info['missing']}")
+            if scan_info.get("error"):
+                parts.append(f"エラー: {scan_info['error']}")
+            list_status.set(" / ".join(parts))
+
+        def refresh_cluster_choices(scan=True):
+            values, counts = _thumbnail_cluster_choices(self.database.get())
+            cluster_counts.clear()
+            cluster_counts.update(counts)
+            cluster_combo.configure(values=tuple(values))
+            if cluster_var.get() not in values:
+                cluster_var.set("すべて")
+            update_list_status()
+            if scan:
+                scan_folder()
+
+        def step_cluster(delta):
+            values = list(cluster_combo.cget("values"))
+            if not values:
+                values = ["すべて"]
+            try:
+                index = values.index(cluster_var.get())
+            except ValueError:
+                index = 0
+            index = max(0, min(len(values) - 1, index + delta))
+            if values[index] != cluster_var.get():
+                cluster_var.set(values[index])
+            scan_folder()
+
+        def reload_view():
+            if current_source() == "SQLiteクラスタ":
+                # Re-read cluster labels so a clustering run done on another
+                # tab is reflected without restarting the app.
+                refresh_cluster_choices(True)
+            else:
+                scan_folder()
+
+        def recluster():
+            nonlocal cluster_in_flight
+            if cluster_in_flight:
+                return
+            if self.pipeline_running:
+                messagebox.showinfo(
+                    "再分類",
+                    "他の解析処理が実行中です。完了してから実行してください。",
+                )
+                return
+            database_text = self.database.get().strip()
+            if not database_text:
+                messagebox.showerror(
+                    "再分類", "SQLiteデータベースを指定してください"
+                )
+                return
+            try:
+                requested = int(self.cluster_count.get())
+                if requested < 1:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(
+                    "クラスタ数", "1以上の整数を入力してください"
+                )
+                return
+            cluster_in_flight = True
+            recluster_btn.configure(state="disabled")
+            list_status.set(f"{requested}クラスタで再計算中…")
+
+            def job():
+                try:
+                    from image_pipeline import assign_clusters
+                    count = assign_clusters(
+                        database_text, clusters=requested
+                    )
+                    results.put(("clustered", None, count))
+                except Exception as exc:
+                    results.put(("clustered", str(exc), 0))
+
+            threading.Thread(target=job, daemon=True).start()
+            schedule_poll()
+
+        def reset_thumbnail_list():
+            nonlocal files, thumb_generation, scan_info
+            files = []
+            scan_info = {}
+            thumb_generation += 1
+            clear_cells()
+            photo_cache.clear()
+            pending.clear()
+            while True:
+                try:
+                    jobs.get_nowait()
+                except queue.Empty:
+                    break
+            canvas.delete("all")
+            canvas.yview_moveto(0)
 
         def scan_folder(*_):
-            nonlocal files, scan_generation, last_folder, scan_in_flight
-            folder_text = folder_var.get().strip()
-            folder = Path(folder_text).expanduser() if folder_text else None
-            folder_name = str(folder) if folder else ""
-            folder_changed = folder_name != last_folder
-            last_folder = folder_name
+            nonlocal scan_generation, last_signature, scan_in_flight
+            source = current_source()
+            folder = None
+            database = None
+            cluster = cluster_var.get().strip() or "すべて"
+            sql_text = sql_var.get()
+            if source == "フォルダ":
+                folder_text = folder_var.get().strip()
+                folder = Path(folder_text).expanduser() if folder_text else None
+                signature = ("folder", str(folder) if folder else "")
+            else:
+                database_text = self.database.get().strip()
+                database = (
+                    Path(database_text).expanduser() if database_text else None
+                )
+                signature = (
+                    "cluster",
+                    str(database) if database else "",
+                    cluster,
+                    sql_text,
+                )
+            changed = signature != last_signature
+            last_signature = signature
             scan_generation += 1
             gen = scan_generation
-            scan_in_flight = bool(folder)
-            if folder_changed:
-                files = []
-                clear_cells()
-                photo_cache.clear()
-                pending.clear()
-                while True:
-                    try:
-                        jobs.get_nowait()
-                    except queue.Empty:
-                        break
-                canvas.delete("all")
-                canvas.yview_moveto(0)
+            scan_in_flight = bool(folder if source == "フォルダ" else database)
+            if changed:
+                reset_thumbnail_list()
                 render(force=True)
-            if folder is None:
+            update_list_status()
+            if not scan_in_flight:
                 render(force=True)
                 return
 
             def job():
                 found = []
+                info = {}
                 try:
-                    if folder.is_dir():
-                        found = [
-                            path
-                            for path in folder.iterdir()
-                            if path.is_file() and path.suffix.lower() in EXTS
-                        ]
-                        found.sort(
-                            key=lambda path: (
-                                safe_mtime(path), str(path).lower()
+                    if source == "フォルダ":
+                        if folder.is_dir():
+                            found = [
+                                path
+                                for path in folder.iterdir()
+                                if path.is_file()
+                                and path.suffix.lower() in EXTS
+                            ]
+                            found.sort(
+                                key=lambda path: (
+                                    safe_mtime(path), str(path).lower()
+                                )
                             )
+                    else:
+                        found, info = _thumbnail_cluster_paths(
+                            database, cluster, sql_text
                         )
-                except Exception:
+                except Exception as exc:
                     found = []
-                results.put(("scan", gen, found))
+                    info = {"total": 0, "missing": 0, "error": str(exc)}
+                results.put(("scan", gen, found, info))
 
             threading.Thread(target=job, daemon=True).start()
             schedule_poll()
@@ -624,37 +984,55 @@ class App:
 
         def on_folder_change(*_):
             nonlocal scan_job
+            if current_source() != "フォルダ":
+                return
             if scan_job is not None:
                 canvas.after_cancel(scan_job)
             scan_job = canvas.after(400, scan_folder)
 
+        def on_database_change(*_):
+            nonlocal database_job
+            if database_job is not None:
+                canvas.after_cancel(database_job)
+            database_job = canvas.after(
+                500,
+                lambda: refresh_cluster_choices(
+                    current_source() == "SQLiteクラスタ"
+                ),
+            )
+
+        def on_source_change(event=None):
+            if current_source() == "SQLiteクラスタ":
+                refresh_cluster_choices(True)
+            else:
+                scan_folder()
+
+        def on_cluster_change(event=None):
+            scan_folder()
+
         def on_map(event):
             if event.widget is not f:
                 return
-            if folder_var.get().strip():
+            if current_source() == "フォルダ":
+                ready = bool(folder_var.get().strip())
+            else:
+                ready = bool(self.database.get().strip())
+            if ready:
                 # Re-scan when the tab is opened so files added or removed
                 # outside the app are reflected.
-                scan_folder()
+                reload_view()
             else:
                 canvas.after(50, lambda: render(force=True))
 
-        column_var = tk.StringVar(value="8")
-        controls = ttk.Frame(f)
-        controls.grid(row=1, column=0, sticky="e")
-        ttk.Button(
-            folder_controls,
-            text="フォルダを1つ選ぶ…",
-            command=lambda: choose_thumbnail_folder(),
-        ).grid(row=0, column=2)
-        ttk.Label(controls, text="1列の画像数").pack(side="left")
-        ttk.Spinbox(
-            controls, from_=1, to=12, width=5, textvariable=column_var,
-            command=set_columns,
-        ).pack(side="left", padx=4)
-        controls.winfo_children()[-1].bind("<Return>", set_columns)
-        ttk.Button(controls, text="更新", command=scan_folder).pack(side="left")
+        column_spin.bind("<Return>", set_columns)
         folder_entry.bind("<Return>", lambda event: scan_folder())
+        sql_entry.bind("<Return>", lambda event: scan_folder())
+        cluster_count_entry.bind("<Return>", lambda event: recluster())
         folder_var.trace_add("write", on_folder_change)
+        self.database.trace_add("write", on_database_change)
+        source_combo.bind("<<ComboboxSelected>>", on_source_change)
+        cluster_combo.bind("<<ComboboxSelected>>", on_cluster_change)
+        refresh_cluster_choices(False)
         f.bind("<Map>", on_map)
         canvas.configure(yscrollcommand=on_yscroll)
         canvas.bind("<Configure>", on_configure)
@@ -694,6 +1072,19 @@ class App:
             if folder:
                 folder_var.set(folder)
                 scan_folder()
+
+        def choose_thumbnail_database():
+            path = filedialog.askopenfilename(
+                title="サムネイル表示用SQLiteデータベースを選択",
+                filetypes=[
+                    ("SQLite database", "*.sqlite3 *.db *.sqlite"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if path:
+                self.database.set(path)
+                source_var.set("SQLiteクラスタ")
+                refresh_cluster_choices(True)
 
     def pick_pipeline_folder(self):
         p = filedialog.askdirectory(title="解析する画像フォルダ")

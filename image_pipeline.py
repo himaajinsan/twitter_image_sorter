@@ -160,6 +160,7 @@ def connect_database(path: str | Path) -> sqlite3.Connection:
             cluster_id INTEGER,
             sequence_group INTEGER,
             sequence_index INTEGER,
+            sequence_score REAL,
             analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_images_cluster ON images(cluster_id);
@@ -169,6 +170,7 @@ def connect_database(path: str | Path) -> sqlite3.Connection:
     for name, definition in (
         ("sequence_group", "INTEGER"),
         ("sequence_index", "INTEGER"),
+        ("sequence_score", "REAL"),
     ):
         if name not in columns:
             db.execute(f"ALTER TABLE images ADD COLUMN {name} {definition}")
@@ -247,7 +249,10 @@ def detect_sequences(
             continue
         rows.append({**dict(row), "_modified_at": file_modified_at})
     rows.sort(key=lambda row: row.get("_modified_at", float("inf")))
-    db.execute("UPDATE images SET sequence_group = NULL, sequence_index = NULL")
+    db.execute(
+        "UPDATE images SET sequence_group = NULL, sequence_index = NULL, "
+        "sequence_score = NULL"
+    )
     db.commit()
     device, mode = torch_device(use_gpu)
     print(f"[GPU] Sequence checker device: {mode} ({device})", flush=True)
@@ -323,8 +328,9 @@ def detect_sequences(
                 score, sequence = best
                 for sequence_index, row in enumerate(sequence):
                     db.execute(
-                        "UPDATE images SET sequence_group = ?, sequence_index = ? WHERE id = ?",
-                        (group_id, sequence_index, row["id"]),
+                        "UPDATE images SET sequence_group = ?, "
+                        "sequence_index = ?, sequence_score = ? WHERE id = ?",
+                        (group_id, sequence_index, score, row["id"]),
                     )
                 db.commit()
                 group_id += 1
@@ -375,7 +381,8 @@ def clear_sequence_group(database: str | Path, sequence_group: int) -> int:
     db = connect_database(database)
     try:
         cursor = db.execute(
-            "UPDATE images SET sequence_group = NULL, sequence_index = NULL "
+            "UPDATE images SET sequence_group = NULL, sequence_index = NULL, "
+            "sequence_score = NULL "
             "WHERE sequence_group = ?",
             (sequence_group,),
         )
@@ -445,7 +452,8 @@ def add_sequence_group(database: str | Path, paths: Sequence[str | Path]) -> int
             "FROM images WHERE sequence_group IS NOT NULL"
         ).fetchone()[0]
         db.executemany(
-            "UPDATE images SET sequence_group = ?, sequence_index = ? WHERE path = ?",
+            "UPDATE images SET sequence_group = ?, sequence_index = ?, "
+            "sequence_score = 1.0 WHERE path = ?",
             [(next_group, index, path) for index, path in enumerate(ordered_paths)],
         )
         db.commit()
@@ -812,25 +820,131 @@ def score_nsfw_folder(
     return done, errors
 
 
-def assign_clusters(database: str | Path, *, clusters: int = 20) -> int:
+def assign_clusters(
+    database: str | Path,
+    *,
+    clusters: int = 20,
+    keep_sequence_groups: bool = True,
+) -> int:
+    """Assign cluster labels to analyzed images.
+
+    Sequence groups are the image sets that the continuity checker matched by
+    boundary score.  When ``keep_sequence_groups`` is true, every group is
+    collapsed into one weighted centroid before clustering, so all of its
+    images always receive the same cluster label.  The centroid weight is the
+    group's stored match score multiplied by its member count: strongly
+    matched groups have more influence, while a group still counts roughly
+    like the individual images it contains.
+    """
     try:
         import numpy as np
-        from sklearn.cluster import MiniBatchKMeans
+        from sklearn.cluster import KMeans, MiniBatchKMeans
     except ImportError as exc:
         raise RuntimeError("クラスタリングには numpy と scikit-learn が必要です。") from exc
     db = connect_database(database)
-    rows = db.execute("SELECT id, embedding FROM images WHERE embedding IS NOT NULL").fetchall()
+    rows = db.execute(
+        "SELECT id, embedding, sequence_group, sequence_score FROM images "
+        "WHERE embedding IS NOT NULL ORDER BY id"
+    ).fetchall()
     if not rows:
+        db.close()
         raise RuntimeError("埋め込みがありません。先に analyze を実行してください。")
-    count = min(max(1, clusters), len(rows))
-    matrix = np.stack([np.frombuffer(row["embedding"], dtype=np.float32) for row in rows])
-    labels = MiniBatchKMeans(n_clusters=count, random_state=42, n_init="auto", batch_size=256).fit_predict(matrix)
-    db.executemany("UPDATE images SET cluster_id = ? WHERE id = ?",
-                   [(int(label), row["id"]) for row, label in zip(rows, labels)])
+    matrix = np.stack([
+        np.frombuffer(row["embedding"], dtype=np.float32) for row in rows
+    ]).astype(np.float32)
+    # Embeddings are normally L2-normalized already. Normalize defensively so
+    # older databases and partial imports still behave as cosine similarity.
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    matrix = matrix / np.maximum(norms, 1e-12)
+
+    unit_vectors = []
+    unit_ids = []
+    weights = []
+    if keep_sequence_groups:
+        group_order = []
+        group_indices = {}
+        for index, row in enumerate(rows):
+            group = row["sequence_group"]
+            if group is None:
+                continue
+            group = int(group)
+            if group not in group_indices:
+                group_indices[group] = []
+                group_order.append(group)
+            group_indices[group].append(index)
+
+        for index, row in enumerate(rows):
+            group = row["sequence_group"]
+            if group is None:
+                unit_vectors.append(matrix[index])
+                unit_ids.append([row["id"]])
+                weights.append(1.0)
+
+        for group in group_order:
+            indices = group_indices[group]
+            vectors = matrix[indices]
+            centroid = vectors.mean(axis=0)
+            centroid_norm = float(np.linalg.norm(centroid))
+            if centroid_norm > 0:
+                centroid = centroid / centroid_norm
+            stored_scores = [
+                float(rows[index]["sequence_score"])
+                for index in indices
+                if rows[index]["sequence_score"] is not None
+            ]
+            if stored_scores:
+                match = float(np.mean(stored_scores))
+            else:
+                # Groups created before sequence_score was stored fall back
+                # to the group's own embedding coherence.
+                match = float(np.mean(vectors @ centroid))
+            match = min(1.0, max(0.0, match))
+            unit_vectors.append(centroid)
+            unit_ids.append([rows[index]["id"] for index in indices])
+            weights.append(max(1e-3, len(indices) * max(match, 0.05)))
+    else:
+        for index, row in enumerate(rows):
+            unit_vectors.append(matrix[index])
+            unit_ids.append([row["id"]])
+            weights.append(1.0)
+
+    unit_matrix = np.stack(unit_vectors).astype(np.float32)
+    unit_norms = np.linalg.norm(unit_matrix, axis=1, keepdims=True)
+    unit_matrix = unit_matrix / np.maximum(unit_norms, 1e-12)
+    count = min(max(1, int(clusters)), len(unit_matrix))
+    weight_array = np.asarray(weights, dtype=np.float64)
+
+    if count <= 1:
+        labels = np.zeros(len(unit_matrix), dtype=np.int32)
+    elif count >= len(unit_matrix):
+        # More requested clusters than matcheable units: each unit becomes
+        # its own cluster instead of creating empty clusters.
+        labels = np.arange(len(unit_matrix), dtype=np.int32)
+    elif len(unit_matrix) <= 20000:
+        labels = KMeans(
+            n_clusters=count, random_state=42, n_init="auto"
+        ).fit_predict(unit_matrix, sample_weight=weight_array).astype(np.int32)
+    else:
+        # MiniBatch keeps very large libraries practical. It is still
+        # similarity-based because the vectors are normalized.
+        labels = MiniBatchKMeans(
+            n_clusters=count, random_state=42, n_init="auto", batch_size=256
+        ).fit_predict(unit_matrix, sample_weight=weight_array).astype(np.int32)
+
+    # Rows without an embedding must not keep a label from an older run.
+    db.execute("UPDATE images SET cluster_id = NULL")
+    db.executemany(
+        "UPDATE images SET cluster_id = ? WHERE id = ?",
+        [
+            (int(label), image_id)
+            for label, ids in zip(labels, unit_ids)
+            for image_id in ids
+        ],
+    )
     db.commit()
     db.close()
     clear_embedding_cache()
-    return count
+    return int(len(np.unique(labels)))
 
 
 def _expand_sequence_results(db, rows, limit):

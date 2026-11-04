@@ -8,7 +8,7 @@ if not exist "%VENV_PYTHON%" (
   echo Creating local Python environment in %VENV_DIR% ...
   "%SYSTEM_PYTHON%" -m venv "%VENV_DIR%"
   if errorlevel 1 (
-    echo Failed to create the local environment. Install Python 3.10 or 3.11.
+    echo Failed to create the local environment. Install Python 3.11 or 3.12.
     pause
     exit /b 1
   )
